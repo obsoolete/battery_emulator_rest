@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import asyncio
+import ipaddress
 import logging
 import re
+import socket
 from datetime import datetime, timedelta
 from time import monotonic
 
 import aiohttp
+from yarl import URL
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
@@ -19,15 +22,63 @@ from homeassistant.util import dt as dt_util
 
 from .const import (
     CONF_HOST,
+    CONF_RESOLVED_IP,
     CONF_SCAN_INTERVAL,
     DEFAULT_SCAN_INTERVAL,
+    DNS_TIMEOUT,
     DOMAIN,
     LAST_SUCCESSFUL_UPDATE,
     MAX_CHARGE_SPEED,
     MAX_DISCHARGE_SPEED,
+    REQUEST_TIMEOUT,
 )
 
 _LOGGER = logging.getLogger(__name__)
+
+
+def _normalize_base_url(host: str) -> URL:
+    """Return a normalized HTTP URL for a hostname, IPv4, or IPv6 input."""
+    value = host.strip().rstrip("/")
+    try:
+        address = ipaddress.ip_address(value.strip("[]"))
+    except ValueError:
+        url = URL(value if "://" in value else f"http://{value}")
+    else:
+        url = URL.build(scheme="http", host=str(address))
+
+    if url.scheme not in ("http", "https") or url.host is None:
+        raise ValueError(
+            "Host must be an HTTP(S) DNS hostname, IPv4 address, or IPv6 address"
+        )
+    return url
+
+
+def _is_ip_address(host: str) -> bool:
+    """Return whether host is a literal IPv4 or IPv6 address."""
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        return False
+    return True
+
+
+async def _async_resolve_host(url: URL) -> str:
+    """Resolve a configured URL host to one concrete IP address."""
+    host = url.host
+    if host is None:
+        raise socket.gaierror("URL has no host")
+    if _is_ip_address(host):
+        return host
+
+    async with asyncio.timeout(DNS_TIMEOUT):
+        addresses = await asyncio.get_running_loop().getaddrinfo(
+            host,
+            url.port or (443 if url.scheme == "https" else 80),
+            type=socket.SOCK_STREAM,
+        )
+    if not addresses:
+        raise socket.gaierror(f"No addresses returned for {host}")
+    return addresses[0][4][0]
 
 
 class BatteryEmulatorCoordinator(DataUpdateCoordinator[dict[str, float | datetime | None]]):
@@ -48,14 +99,51 @@ class BatteryEmulatorCoordinator(DataUpdateCoordinator[dict[str, float | datetim
             config_entry=config_entry,
             update_interval=timedelta(seconds=scan_interval),
         )
-        host = config_entry.data[CONF_HOST].rstrip("/")
-        if not host.startswith(("http://", "https://")):
-            host = f"http://{host}"
-        self.host: str = host
+        self._configured_url = _normalize_base_url(config_entry.data[CONF_HOST])
+        self.host = str(self._configured_url).rstrip("/")
+        self._resolved_ip: str | None = config_entry.data.get(CONF_RESOLVED_IP)
         self.device_name: str = "Battery Emulator"
         self._request_lock = asyncio.Lock()
         self._backoff_until_monotonic = 0.0
         self._failure_backoff_seconds = max(10, int(self.update_interval.total_seconds()))
+
+    async def _async_request_target(
+        self,
+    ) -> tuple[str, dict[str, str], str | None]:
+        """Select a concrete request URL while preserving HTTP and TLS hostnames."""
+        configured_host = self._configured_url.host
+        if configured_host is None or _is_ip_address(configured_host):
+            return self.host, {}, None
+
+        try:
+            resolved_ip = await _async_resolve_host(self._configured_url)
+        except (TimeoutError, socket.gaierror, OSError) as err:
+            if self._resolved_ip is None:
+                raise UpdateFailed(
+                    f"DNS lookup failed for {configured_host} and no cached IP is available"
+                ) from err
+            resolved_ip = self._resolved_ip
+            _LOGGER.warning(
+                "DNS lookup failed for %s; using cached IP %s",
+                configured_host,
+                resolved_ip,
+            )
+        else:
+            if resolved_ip != self._resolved_ip:
+                self._resolved_ip = resolved_ip
+                self.hass.config_entries.async_update_entry(
+                    self.config_entry,
+                    data={
+                        **self.config_entry.data,
+                        CONF_RESOLVED_IP: resolved_ip,
+                    },
+                )
+
+        request_url = str(self._configured_url.with_host(resolved_ip)).rstrip("/")
+        server_hostname = (
+            configured_host if self._configured_url.scheme == "https" else None
+        )
+        return request_url, {"Host": self._configured_url.raw_authority}, server_hostname
 
     @property
     def device_info(self) -> DeviceInfo:
@@ -80,14 +168,21 @@ class BatteryEmulatorCoordinator(DataUpdateCoordinator[dict[str, float | datetim
 
         # Scrape device name from the root page.
         try:
-            async with asyncio.timeout(10):
-                resp = await self.session.get(self.host)
+            request_url, request_headers, server_hostname = (
+                await self._async_request_target()
+            )
+            async with asyncio.timeout(REQUEST_TIMEOUT):
+                resp = await self.session.get(
+                    request_url,
+                    headers=request_headers,
+                    server_hostname=server_hostname,
+                )
                 resp.raise_for_status()
                 html = await resp.text()
             match = re.search(r"Battery protocol:\s*([^<]+)", html)
             if match:
                 self.device_name = match.group(1).strip()
-        except (TimeoutError, aiohttp.ClientError):
+        except (TimeoutError, aiohttp.ClientError, UpdateFailed):
             _LOGGER.warning("Could not fetch device name from %s", self.host)
 
     async def _async_update_data(self) -> dict[str, float | datetime | None]:
@@ -106,8 +201,15 @@ class BatteryEmulatorCoordinator(DataUpdateCoordinator[dict[str, float | datetim
 
         try:
             async with self._request_lock:
-                async with asyncio.timeout(10):
-                    resp = await self.session.get(f"{self.host}/settings")
+                request_url, request_headers, server_hostname = (
+                    await self._async_request_target()
+                )
+                async with asyncio.timeout(REQUEST_TIMEOUT):
+                    resp = await self.session.get(
+                        f"{request_url}/settings",
+                        headers=request_headers,
+                        server_hostname=server_hostname,
+                    )
                     resp.raise_for_status()
                     html = await resp.text()
         except (TimeoutError, aiohttp.ClientError) as err:
@@ -145,9 +247,15 @@ class BatteryEmulatorCoordinator(DataUpdateCoordinator[dict[str, float | datetim
         """Send a value update to the device and refresh data."""
         try:
             async with self._request_lock:
-                async with asyncio.timeout(10):
+                request_url, request_headers, server_hostname = (
+                    await self._async_request_target()
+                )
+                async with asyncio.timeout(REQUEST_TIMEOUT):
                     resp = await self.session.get(
-                        f"{self.host}/{endpoint}", params={"value": str(value)}
+                        f"{request_url}/{endpoint}",
+                        params={"value": str(value)},
+                        headers=request_headers,
+                        server_hostname=server_hostname,
                     )
                     resp.raise_for_status()
         except (TimeoutError, aiohttp.ClientError) as err:
@@ -162,9 +270,15 @@ class BatteryEmulatorCoordinator(DataUpdateCoordinator[dict[str, float | datetim
         """Trigger a SOC calibration on the device."""
         try:
             async with self._request_lock:
-                async with asyncio.timeout(10):
+                request_url, request_headers, server_hostname = (
+                    await self._async_request_target()
+                )
+                async with asyncio.timeout(REQUEST_TIMEOUT):
                     resp = await self.session.put(
-                        f"{self.host}/calibrateSOC", data="0"
+                        f"{request_url}/calibrateSOC",
+                        data="0",
+                        headers=request_headers,
+                        server_hostname=server_hostname,
                     )
                     resp.raise_for_status()
         except (TimeoutError, aiohttp.ClientError) as err:

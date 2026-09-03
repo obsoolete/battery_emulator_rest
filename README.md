@@ -26,6 +26,12 @@ A Home Assistant custom integration for controlling a Battery Emulator device vi
 
 ## Configuration
 
-During setup, provide the host URL of your Battery Emulator device (e.g. `http://192.168.1.2`).
+During setup, provide the HTTP(S) DNS hostname, IPv4 address, or IPv6 address of your Battery Emulator device (e.g. `battery-emulator.home`, `http://192.168.1.2`, or `http://[2001:db8::2]`).
+
+When configured with a DNS hostname, the integration stores the last successfully resolved IP address. It refreshes that address while DNS is available and uses the cached address during a DNS outage. A literal IP address bypasses DNS entirely.
+
+An existing hostname-based entry must resolve successfully once after upgrading to seed its fallback address. Initial configuration also requires working DNS because no address has been cached yet.
 
 The polling interval can be adjusted after setup via the integration's **Configure** button (default: 30 seconds).
+
+To change the device address later, open **Settings → Devices & Services**, select the Battery Emulator integration, and choose **Reconfigure** from its menu. The new connection is validated before the existing entry is updated and reloaded.
