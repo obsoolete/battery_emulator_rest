@@ -8,7 +8,7 @@ import logging
 import re
 import socket
 from datetime import datetime, timedelta
-from time import monotonic
+from typing import Awaitable, Callable, TypeVar
 
 import aiohttp
 from yarl import URL
@@ -30,10 +30,17 @@ from .const import (
     LAST_SUCCESSFUL_UPDATE,
     MAX_CHARGE_SPEED,
     MAX_DISCHARGE_SPEED,
+    READ_RETRY_DELAYS,
     REQUEST_TIMEOUT,
+    STALE_FAILURE_LIMIT,
 )
 
 _LOGGER = logging.getLogger(__name__)
+_ReadResultT = TypeVar("_ReadResultT")
+
+
+class IncompleteSettingsResponse(Exception):
+    """Error raised when a settings response is missing required values."""
 
 
 def _normalize_base_url(host: str) -> URL:
@@ -104,8 +111,7 @@ class BatteryEmulatorCoordinator(DataUpdateCoordinator[dict[str, float | datetim
         self._resolved_ip: str | None = config_entry.data.get(CONF_RESOLVED_IP)
         self.device_name: str = "Battery Emulator"
         self._request_lock = asyncio.Lock()
-        self._backoff_until_monotonic = 0.0
-        self._failure_backoff_seconds = max(10, int(self.update_interval.total_seconds()))
+        self._consecutive_failures = 0
 
     async def _async_request_target(
         self,
@@ -145,6 +151,89 @@ class BatteryEmulatorCoordinator(DataUpdateCoordinator[dict[str, float | datetim
         )
         return request_url, {"Host": self._configured_url.raw_authority}, server_hostname
 
+    async def _async_get_text(self, path: str) -> str:
+        """Fetch one complete text response."""
+        request_url, request_headers, server_hostname = (
+            await self._async_request_target()
+        )
+        headers = {**request_headers, "Connection": "close"}
+        async with asyncio.timeout(REQUEST_TIMEOUT):
+            async with self.session.get(
+                f"{request_url}{path}",
+                headers=headers,
+                server_hostname=server_hostname,
+            ) as response:
+                response.raise_for_status()
+                return await response.text()
+
+    async def _async_retry_read(
+        self,
+        description: str,
+        operation: Callable[[], Awaitable[_ReadResultT]],
+    ) -> _ReadResultT:
+        """Retry an idempotent read after transient transport failures."""
+        attempts = len(READ_RETRY_DELAYS) + 1
+        last_error: Exception | None = None
+
+        for attempt in range(1, attempts + 1):
+            try:
+                return await operation()
+            except aiohttp.ClientResponseError as err:
+                raise UpdateFailed(
+                    f"{description} returned HTTP {err.status}"
+                ) from err
+            except (
+                TimeoutError,
+                aiohttp.ClientError,
+                IncompleteSettingsResponse,
+                UpdateFailed,
+            ) as err:
+                last_error = err
+                if attempt == attempts:
+                    break
+                _LOGGER.debug(
+                    "%s attempt %d/%d failed with %s; retrying",
+                    description,
+                    attempt,
+                    attempts,
+                    self._describe_error(err),
+                )
+                await asyncio.sleep(READ_RETRY_DELAYS[attempt - 1])
+
+        raise UpdateFailed(
+            f"{description} failed after {attempts} attempts: "
+            f"{self._describe_error(last_error)}"
+        ) from last_error
+
+    async def _async_read_settings(
+        self,
+    ) -> dict[str, float | datetime | None]:
+        """Fetch and parse a complete settings response."""
+        html = await self._async_get_text("/settings")
+        max_charge = self._parse_float(
+            html, r"Max charge speed:\s*([\d.]+)\s*A"
+        )
+        max_discharge = self._parse_float(
+            html, r"Max discharge speed:\s*([\d.]+)\s*A"
+        )
+        if max_charge is None or max_discharge is None:
+            raise IncompleteSettingsResponse(
+                "response did not contain both charge and discharge limits"
+            )
+        return {
+            MAX_CHARGE_SPEED: max_charge,
+            MAX_DISCHARGE_SPEED: max_discharge,
+            LAST_SUCCESSFUL_UPDATE: dt_util.utcnow(),
+        }
+
+    @staticmethod
+    def _describe_error(error: Exception | None) -> str:
+        """Return an error description that is useful even for blank timeouts."""
+        if error is None:
+            return "unknown error"
+        detail = str(error).strip()
+        return f"{type(error).__name__}: {detail}" if detail else type(error).__name__
+
     @property
     def device_info(self) -> DeviceInfo:
         """Return device info for the Battery Emulator."""
@@ -168,21 +257,14 @@ class BatteryEmulatorCoordinator(DataUpdateCoordinator[dict[str, float | datetim
 
         # Scrape device name from the root page.
         try:
-            request_url, request_headers, server_hostname = (
-                await self._async_request_target()
+            html = await self._async_retry_read(
+                "Device information request",
+                lambda: self._async_get_text(""),
             )
-            async with asyncio.timeout(REQUEST_TIMEOUT):
-                resp = await self.session.get(
-                    request_url,
-                    headers=request_headers,
-                    server_hostname=server_hostname,
-                )
-                resp.raise_for_status()
-                html = await resp.text()
             match = re.search(r"Battery protocol:\s*([^<]+)", html)
             if match:
                 self.device_name = match.group(1).strip()
-        except (TimeoutError, aiohttp.ClientError, UpdateFailed):
+        except UpdateFailed:
             _LOGGER.warning("Could not fetch device name from %s", self.host)
 
     async def _async_update_data(self) -> dict[str, float | datetime | None]:
@@ -193,36 +275,33 @@ class BatteryEmulatorCoordinator(DataUpdateCoordinator[dict[str, float | datetim
                 return self.data
             raise UpdateFailed("Previous request still in progress")
 
-        if monotonic() < self._backoff_until_monotonic:
-            _LOGGER.debug("Skipping update for %s during failure backoff window", self.host)
-            if self.data:
-                return self.data
-            raise UpdateFailed("Waiting before retrying after previous failure")
-
         try:
             async with self._request_lock:
-                request_url, request_headers, server_hostname = (
-                    await self._async_request_target()
+                data = await self._async_retry_read(
+                    "Settings request",
+                    self._async_read_settings,
                 )
-                async with asyncio.timeout(REQUEST_TIMEOUT):
-                    resp = await self.session.get(
-                        f"{request_url}/settings",
-                        headers=request_headers,
-                        server_hostname=server_hostname,
-                    )
-                    resp.raise_for_status()
-                    html = await resp.text()
-        except (TimeoutError, aiohttp.ClientError) as err:
-            self._backoff_until_monotonic = monotonic() + self._failure_backoff_seconds
-            raise UpdateFailed(f"Error fetching data from {self.host}/settings: {err}") from err
+        except UpdateFailed as err:
+            self._consecutive_failures += 1
+            if self.data and self._consecutive_failures < STALE_FAILURE_LIMIT:
+                log = _LOGGER.warning if self._consecutive_failures == 1 else _LOGGER.debug
+                log(
+                    "Battery Emulator update failed; retaining last data "
+                    "(%d/%d failed cycles): %s",
+                    self._consecutive_failures,
+                    STALE_FAILURE_LIMIT,
+                    err,
+                )
+                return self.data
+            raise
 
-        self._backoff_until_monotonic = 0.0
-
-        return {
-            MAX_CHARGE_SPEED: self._parse_float(html, r"Max charge speed:\s*([\d.]+)\s*A"),
-            MAX_DISCHARGE_SPEED: self._parse_float(html, r"Max discharge speed:\s*([\d.]+)\s*A"),
-            LAST_SUCCESSFUL_UPDATE: dt_util.utcnow(),
-        }
+        if self._consecutive_failures:
+            _LOGGER.info(
+                "Battery Emulator recovered after %d failed update cycle(s)",
+                self._consecutive_failures,
+            )
+            self._consecutive_failures = 0
+        return data
 
     @staticmethod
     def _parse_float(html: str, pattern: str) -> float | None:
@@ -251,19 +330,18 @@ class BatteryEmulatorCoordinator(DataUpdateCoordinator[dict[str, float | datetim
                     await self._async_request_target()
                 )
                 async with asyncio.timeout(REQUEST_TIMEOUT):
-                    resp = await self.session.get(
+                    async with self.session.get(
                         f"{request_url}/{endpoint}",
                         params={"value": str(value)},
-                        headers=request_headers,
+                        headers={**request_headers, "Connection": "close"},
                         server_hostname=server_hostname,
-                    )
-                    resp.raise_for_status()
-        except (TimeoutError, aiohttp.ClientError) as err:
-            self._backoff_until_monotonic = monotonic() + self._failure_backoff_seconds
+                    ) as response:
+                        response.raise_for_status()
+        except (TimeoutError, aiohttp.ClientError, UpdateFailed) as err:
             raise UpdateFailed(
-                f"Error sending update to {self.host}/{endpoint}: {err}"
+                f"Error sending update to {self.host}/{endpoint}: "
+                f"{self._describe_error(err)}"
             ) from err
-        self._backoff_until_monotonic = 0.0
         await self.async_request_refresh()
 
     async def async_calibrate_soc(self) -> None:
@@ -274,17 +352,16 @@ class BatteryEmulatorCoordinator(DataUpdateCoordinator[dict[str, float | datetim
                     await self._async_request_target()
                 )
                 async with asyncio.timeout(REQUEST_TIMEOUT):
-                    resp = await self.session.put(
+                    async with self.session.put(
                         f"{request_url}/calibrateSOC",
                         data="0",
-                        headers=request_headers,
+                        headers={**request_headers, "Connection": "close"},
                         server_hostname=server_hostname,
-                    )
-                    resp.raise_for_status()
-        except (TimeoutError, aiohttp.ClientError) as err:
-            self._backoff_until_monotonic = monotonic() + self._failure_backoff_seconds
+                    ) as response:
+                        response.raise_for_status()
+        except (TimeoutError, aiohttp.ClientError, UpdateFailed) as err:
             raise UpdateFailed(
-                f"Error calibrating SOC at {self.host}/calibrateSOC: {err}"
+                f"Error calibrating SOC at {self.host}/calibrateSOC: "
+                f"{self._describe_error(err)}"
             ) from err
-        self._backoff_until_monotonic = 0.0
         await self.async_request_refresh()

@@ -35,3 +35,9 @@ An existing hostname-based entry must resolve successfully once after upgrading 
 The polling interval can be adjusted after setup via the integration's **Configure** button (default: 30 seconds).
 
 To change the device address later, open **Settings → Devices & Services**, select the Battery Emulator integration, and choose **Reconfigure** from its menu. The new connection is validated before the existing entry is updated and reloaded.
+
+## Connection reliability
+
+The integration retries incomplete, disconnected, or timed-out reads up to three times. After data has been received successfully, the previous values remain available through two consecutive failed polling cycles. A third failed cycle marks the entities unavailable so a sustained outage is still visible.
+
+The **Last Successful Update** diagnostic sensor is not advanced while cached values are retained and can be used to determine their freshness. State-changing commands are not retried automatically, which avoids applying a command twice when the device drops its response.
