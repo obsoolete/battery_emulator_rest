@@ -211,10 +211,10 @@ class BatteryEmulatorCoordinator(DataUpdateCoordinator[dict[str, float | datetim
         """Fetch and parse a complete settings response."""
         html = await self._async_get_text("/settings")
         max_charge = self._parse_float(
-            html, r"Max charge speed:\s*([\d.]+)\s*A"
+            html, r"Max charge (?:speed|current):\s*([\d.]+)\s*A"
         )
         max_discharge = self._parse_float(
-            html, r"Max discharge speed:\s*([\d.]+)\s*A"
+            html, r"Max discharge (?:speed|current):\s*([\d.]+)\s*A"
         )
         if max_charge is None or max_discharge is None:
             raise IncompleteSettingsResponse(
